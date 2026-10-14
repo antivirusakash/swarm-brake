@@ -1,4 +1,20 @@
+<div align="center">
+
+<img src=".claude-plugin/icon.png" alt="swarm-brake: a bee holding a stop sign while two smaller bees wait" width="160">
+
 # swarm-brake
+
+**Keep Claude Code and Codex agent swarms from freezing your Mac.**
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-d97757.svg)](#install)
+[![Codex CLI](https://img.shields.io/badge/Codex%20CLI-0.154%2B-black.svg)](#install)
+[![macOS](https://img.shields.io/badge/tested%20on-macOS-lightgrey.svg)](#status)
+[![bash 3.2](https://img.shields.io/badge/bash-3.2-4EAA25.svg)](bin/swarm-brake)
+
+[Install](#install) · [Before and after](#before-and-after) · [Settings](#settings) · [Logs and the report](#logs-and-the-report)
+
+</div>
 
 Your Claude Code agents froze your Mac again. swarm-brake is a hook plugin for Claude Code and Codex CLI that makes heavy jobs (video renders, builds, headless Chrome) wait their turn when memory or CPU runs low, cleans up the Chrome processes renders leave behind, and logs every heavy job so you can see what froze the machine.
 

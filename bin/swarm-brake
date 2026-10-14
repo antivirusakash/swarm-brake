@@ -66,9 +66,7 @@ EV_LINE_MAX=400 PRESSURE_CRITICAL=4 RELEASE_GRACE=3 FAST_CHECKS=10 LOCK_STALE=30
 
 ev() {
   local ts t day line kv
-  read -r ts t day <<EOF
-$(date '+%s %H:%M:%S %F')
-EOF
+  read -r ts t day < <(date '+%s %H:%M:%S %F')
   line="ts=$ts t=$t v=1 ev=$1 mode=$SB_MODE"; shift
   for kv in "$@"; do line="$line $kv"; done
   [ ${#line} -le "$EV_LINE_MAX" ] || return 0
@@ -90,9 +88,7 @@ where_of() {
 
 hook_facts() {
   local us=$'\037'
-  IFS=$us read -r CALL SESS CWD AGENT EVENT <<EOF
-$(printf '%s' "$INPUT" | jq -r '[(.tool_use_id // .call_id // ""), (.session_id // ""), (.cwd // ""), (.agent_id // ""), (.hook_event_name // "")] | map(tostring) | join("\u001f")' 2>/dev/null)
-EOF
+  IFS=$us read -r CALL SESS CWD AGENT EVENT < <(printf '%s' "$INPUT" | jq -r '[(.tool_use_id // .call_id // ""), (.session_id // ""), (.cwd // ""), (.agent_id // ""), (.hook_event_name // "")] | map(tostring) | join("\u001f")' 2>/dev/null)
   CALL=$(printf '%s' "${CALL:-}" | tr -cd 'A-Za-z0-9_-' | cut -c1-64); SESS=${SESS:-}; CWD=${CWD:-}; AGENT=${AGENT:-}; EVENT=${EVENT:-}
 }
 
@@ -270,9 +266,7 @@ lock() {
 break_stale_lock() {
   local cur hp ht old="$SB_STATE/lock.stale.$MYPID"
   cur=$(readlink "$SB_STATE/lock" 2>/dev/null) || return 0
-  read -r hp ht _ <<EOF
-$cur
-EOF
+  read -r hp ht _ < <(printf '%s\n' "$cur")
   kill -0 "$hp" 2>/dev/null && [ $(( $(now) - $(int "${ht:-}" 0) )) -le "$LOCK_STALE" ] && return 0
   rm -f "$old"
   if mv "$SB_STATE/lock" "$old" 2>/dev/null; then
@@ -309,9 +303,7 @@ watch_job() {
         [ -n "$pid" ] && [ "$age" -le $(( t - granted + 1 )) ] || continue
         case "$progs" in *" $pg "*) ;; *) continue ;; esac
         grep -qx "$pid" "$SB_STATE/claimed" 2>/dev/null || { p=$pid; break; }
-      done <<EOF
-$roots
-EOF
+      done < <(printf '%s\n' "$roots")
       if [ -n "$p" ] && holds; then
         claim_pid "$p"
         rm -f "$lease"; unlock
@@ -326,9 +318,7 @@ EOF
   ev start "call=$call" "pid=$p" "prog=$pg" "lag=$(( $(now) - granted ))"
   local alive rss orph tree reniced=0
   if [ "$SB_MODE" = enforce ]; then
-    read -r alive rss orph tree <<EOF
-$(job_tree "$p" "")
-EOF
+    read -r alive rss orph tree < <(job_tree "$p" "")
     # shellcheck disable=SC2086
     [ "$SB_NICE" -gt 0 ] && renice "$SB_NICE" -p $tree >/dev/null 2>&1 && reniced=1
     if [ "$SB_QOS" = background ] && [ "$(uname)" = Darwin ]; then
@@ -357,9 +347,7 @@ follow_job() {
   start=$(( $(now) - $(ps -o etime= -p "$root" 2>/dev/null | awk "$SECS_AWK"'{ print secs($1) } END { if (!NR) print 0 }') ))
   last=$start
   while :; do
-    read -r alive rss orph pids <<EOF
-$(job_tree "$root" "$pids")
-EOF
+    read -r alive rss orph pids < <(job_tree "$root" "$pids")
     if [ "${alive:-0}" != 1 ]; then last=$(now); break; fi
     last=$(now)
     [ "${rss:-0}" -gt "$peak" ] && peak=$rss
@@ -385,9 +373,7 @@ minute_reading() {
   roots=$(printf '%s\n' "$table" | awk -v re="$SB_HEAVY_REGEX" -v owner= "$KEY_AWK$HEAVY_ROOTS_AWK" | cut -d' ' -f1)
   ungated=$({ cat "$SB_STATE/claimed" 2>/dev/null; echo --; printf '%s\n' "$roots"; } |
     awk '$1 == "--" { r = 1; next } !r { c[$1] = 1; next } $1 != "" && !($1 in c) { n++ } END { print n + 0 }')
-  read -r claude node <<EOF
-$(printf '%s\n' "$table" | awk '{ n = split($4, a, "/"); b = a[n] } b == "claude" { c++ } b == "node" { d++ } END { print c + 0, d + 0 }')
-EOF
+  read -r claude node < <(printf '%s\n' "$table" | awk '{ n = split($4, a, "/"); b = a[n] } b == "claude" { c++ } b == "node" { d++ } END { print c + 0, d + 0 }')
   sample; HEAVY=$(count_heavy)
   ev pulse $(readings) "ungated=$ungated" "claude=$claude" "node=$node"
 }
@@ -488,13 +474,11 @@ reap_orphans() {
   roots=$(printf '%s\n' "$table" | awk -v re="$SB_REAP_REGEX" -v age="$SB_REAP_AGE" "$SECS_AWK"'
     { pid=$1; ppid=$2; et=$3; $1=$2=$3=$4=""; if (ppid==1 && $0 ~ re && secs(et) >= age) print pid }' | tr '\n' ' ')
   [ -n "${roots// /}" ] || return 0
-  read -r mb tree <<EOF
-$(printf '%s\n' "$table" | awk -v roots="$roots" '
+  read -r mb tree < <(printf '%s\n' "$table" | awk -v roots="$roots" '
     BEGIN{ n=split(roots,r," "); for(i=1;i<=n;i++) keep[r[i]]=1 }
     { kid[$2]=kid[$2] " " $1; rss[$1]=$4 }
     END{ for (p in keep) walk(p); printf "%d%s\n", sum / 1024, out }
     function walk(p,  a,i,n){ out = out " " p; sum += rss[p]; n=split(kid[p],a," "); for(i=1;i<=n;i++) walk(a[i]) }')
-EOF
   # shellcheck disable=SC2086
   kill -TERM $tree 2>/dev/null
   detach kill_if_still_browser "$tree"
