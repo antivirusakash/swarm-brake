@@ -1,0 +1,711 @@
+#!/usr/bin/env bash
+# swarm-brake: keep coding agents from freezing the machine they run on.
+#
+#   swarm-brake gate     PreToolUse hook. Reads the hook JSON on stdin. For a
+#                         heavy shell command (render, build, browser, video),
+#                         waits while memory or CPU is short or too many heavy
+#                         jobs already run, then lets it through at lower
+#                         priority, or denies it with a reason the agent can act on.
+#   swarm-brake done     PostToolUse / PostToolUseFailure hook. Releases the
+#                         slot the gate granted for that tool call.
+#   swarm-brake reap     Stop / SubagentStop / SessionEnd hook. Kills orphaned
+#                         headless-browser trees (parent pid 1) left by renders.
+#   swarm-brake status   One line: memory, load, heavy jobs. Safe for a status line.
+#   swarm-brake report [--days N] [--at TIME [--window MIN]]
+#                         Effectiveness by mode, or a timeline around TIME for an RCA.
+#   swarm-brake classify <command>   Prints heavy or light. For tests and tuning.
+#
+# Any failure lets the command through: internal errors exit 0 with no output,
+# and hooks.json adds `|| true` so even a crash of this script cannot block.
+# Settings: env vars, or KEY=VALUE lines in ~/.config/swarm-brake/config
+# (an env var wins over the same key in the file). Written for bash 3.2.
+
+set -u
+umask 077
+
+CONFIG=${SB_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/swarm-brake/config}
+if [ -r "$CONFIG" ]; then
+  while IFS='=' read -r k v; do
+    [[ $k =~ ^SB_[A-Z_]+$ ]] && [[ $k != SB_FAKE_* ]] || continue
+    v=${v%$'\r'}; v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+    eval "[ -n \"\${$k+x}\" ]" || eval "$k=\$v"
+  done <"$CONFIG"
+fi
+
+int() { case "${1:-}" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+SB_STATE=${SB_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/swarm-brake}
+SB_MAX_HEAVY=$(int "${SB_MAX_HEAVY:-}" 2)
+SB_MEM_MIN=$(int "${SB_MEM_MIN:-}" 20)
+SB_SWAP_MAX=$(int "${SB_SWAP_MAX:-}" 0)
+SB_WAIT=$(int "${SB_WAIT:-}" 90)
+SB_POLL=$(int "${SB_POLL:-}" 5)
+SB_NICE=$(int "${SB_NICE:-}" 10)
+SB_LEASE=$(int "${SB_LEASE:-}" 120)
+SB_REAP_AGE=$(int "${SB_REAP_AGE:-}" 120)
+case "${SB_LOAD_MAX:-}" in ''|*[!0-9.]*) SB_LOAD_MAX=1.5 ;; esac
+[ "$SB_POLL" -gt 0 ] || SB_POLL=1
+HOOK_TIMEOUT=120 LOCK_GIVE_UP=15
+MAX_POLL=10; MAX_WAIT=$(( HOOK_TIMEOUT - LOCK_GIVE_UP - MAX_POLL - 5 ))
+[ "$SB_WAIT" -le "$MAX_WAIT" ] || SB_WAIT=$MAX_WAIT; [ "$SB_POLL" -le "$MAX_POLL" ] || SB_POLL=$MAX_POLL
+SB_MODE=${SB_MODE:-enforce}
+case "$SB_MODE" in observe|enforce) ;; *) SB_MODE=enforce ;; esac
+[ "${SB_DISABLE:-0}" = 1 ] && SB_MODE=disabled
+SB_KEEP_DAYS=$(int "${SB_KEEP_DAYS:-}" 30)
+SB_LOG_CMD=${SB_LOG_CMD:-key}
+SB_TICK=$(int "${SB_TICK:-}" 15)
+SB_QOS=${SB_QOS:-}
+SB_HEAVY_REGEX=${SB_HEAVY_REGEX:-'remotion|ffmpeg|chrome-headless-shell|playwright|puppeteer|xcodebuild|simctl (boot|install|launch)|(npm|pnpm|yarn|bun) (run )?(build|render|still|e2e|test:e2e)|next build|vite build|webpack|cargo (build|test)|gradlew?|docker (build|buildx|compose (up|build|run))|blender|whisper'}
+SB_REAP_REGEX=${SB_REAP_REGEX:-'chrome-headless-shell|puppeteer_dev_chrome_profile|ms-playwright/.*/chrom'}
+
+MYPID=$$
+now() { date +%s; }
+
+EV_DIR="$SB_STATE/events"
+DISTRESS_MEM=10 DISTRESS_LOAD=2.5 STALL_GAP=20
+EV_LINE_MAX=400 PRESSURE_CRITICAL=4 RELEASE_GRACE=3 FAST_CHECKS=10 LOCK_STALE=30
+
+ev() {
+  local ts t day line kv
+  read -r ts t day <<EOF
+$(date '+%s %H:%M:%S %F')
+EOF
+  line="ts=$ts t=$t v=1 ev=$1 mode=$SB_MODE"; shift
+  for kv in "$@"; do line="$line $kv"; done
+  [ ${#line} -le "$EV_LINE_MAX" ] || return 0
+  { mkdir -p "$EV_DIR" && printf '%s\n' "$line" >>"$EV_DIR/$day.log"; } 2>/dev/null
+  return 0
+}
+
+enc() {
+  local v=${1:--}
+  v=${v// /+}; v=${v//[!A-Za-z0-9._:\/,#*+=@%-]/_}
+  printf '%s' "${v:0:${2:-60}}"
+}
+
+where_of() {
+  [ -n "$1" ] || { printf -- -; return; }
+  local b=${1%/}; b=${b##*/}
+  printf '%s#%04x' "$(enc "$b" 24)" $(( $(printf '%s' "$1" | cksum | cut -d' ' -f1) % 65536 ))
+}
+
+hook_facts() {
+  local us=$'\037'
+  IFS=$us read -r CALL SESS CWD AGENT EVENT <<EOF
+$(printf '%s' "$INPUT" | jq -r '[(.tool_use_id // .call_id // ""), (.session_id // ""), (.cwd // ""), (.agent_id // ""), (.hook_event_name // "")] | map(tostring) | join("\u001f")' 2>/dev/null)
+EOF
+  CALL=$(printf '%s' "${CALL:-}" | tr -cd 'A-Za-z0-9_-' | cut -c1-64); SESS=${SESS:-}; CWD=${CWD:-}; AGENT=${AGENT:-}; EVENT=${EVENT:-}
+}
+
+once() { mkdir -p "$SB_STATE/stamps" 2>/dev/null; ( set -C; : >"$SB_STATE/stamps/$1" ) 2>/dev/null; }
+
+KEY_AWK='
+function cmd_sig(s, strict,   n,w,i,b,out,k) {
+  gsub(/["\047(){}]/, " ", s)
+  n = split(s, w, /[ \t]+/); i = 1
+  while (i <= n && (w[i] == "" || w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || w[i] ~ /^(do|then|else|elif|while|until|if|!)$/)) i++
+  while (i <= n) {
+    b = w[i]; sub(/.*\//, "", b)
+    if (b ~ /^(npm|pnpm|yarn|bun)$/ && w[i+1] ~ /^(exec|dlx|x)$/) { i += 2; continue }
+    if (b ~ /^(uv|poetry|pipenv|pdm)$/ && w[i+1] == "run") { i += 2; i = skipflags(w, n, i); continue }
+    if (b == "yarn" && w[i+1] == "workspace") { w[i+2] = "yarn"; i += 2; continue }
+    if (b !~ /^(npx|bunx|pnpx|uvx|time|nice|ionice|nohup|exec|sudo|env|command|caffeinate|timeout|gtimeout|xcrun|arch|stdbuf|xargs|parallel|watch|node|deno|python[0-9.]*|bash|sh|zsh)$/) break
+    i++; i = skipflags(w, n, i)
+    while (i <= n && (w[i] ~ /^[0-9.]+[smhd]?$/ || w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) i++
+  }
+  if (i > n) return ""
+  b = w[i]; sub(/.*\//, "", b); out = b; k = 0
+  for (i++; i <= n && k < 2; i++) {
+    if (strict && w[i] ~ /^-/) break
+    i = skipflags(w, n, i); if (i > n) break
+    out = out " " w[i]; k++
+  }
+  return tolower(out) " "
+}
+function skipflags(w, n, i) {
+  while (i <= n && w[i] ~ /^-/) {
+    if (w[i] ~ /^(-u|-g|-n|-s|-k|-C|-F|-f|-p|-w|--file|--project-name|--prefix|--dir|--cwd|--filter|--workspace|--signal|--kill-after|--interval)$/) i++
+    i++
+  }
+  return i
+}
+function heavy(s) { return cmd_sig(s) ~ ("^(" re ")[ :]") }
+function prog(s,  k) { k = cmd_sig(s); sub(/ .*/, "", k); return k }'
+
+STRIP_AWK='
+BEGIN { SHELL_C = "(^|[ \t;&|(/])(ba|z|da|k)?sh[ \t]+(-[a-z]+[ \t]+)*-[a-z]*c[ \t]*$" }
+heredoc != "" && q == "" { t = $0; sub(/^\t+/, "", t); if (t == heredoc) heredoc = ""; next }
+{
+  out = ""
+  for (i = 1; i <= length($0); i++) {
+    c = substr($0, i, 1)
+    if (q == "") {
+      if (c == "\\") { i++; out = out "Q" }
+      else if (c == "$" && substr($0, i + 1, 1) == "\047") { i++; q = "A"; keep = (out ~ SHELL_C); out = out (keep ? ";" : "Q") }
+      else if (c == "\"" || c == "\047") { q = c; keep = (out ~ SHELL_C); out = out (keep ? ";" : "Q") }
+      else out = out c
+    } else if (c == "\\" && (q == "\"" || q == "A")) { i++; if (keep) out = out substr($0, i, 1) }
+    else if (c == q || (q == "A" && c == "\047")) { q = ""; if (keep) out = out ";" }
+    else if (keep) out = out c
+  }
+  if (q == "" && match(out, /(^|[^<])<<-?[ \t]*Q?[A-Za-z_][A-Za-z0-9_]*/)) {
+    heredoc = substr(out, RSTART, RLENGTH); sub(/^[^<]?<<-?[ \t]*Q?/, "", heredoc)
+    if (substr(out, RSTART, RLENGTH) ~ /Q[A-Za-z_]*$/ && match($0, /<<-?[ \t]*["\047][A-Za-z_][A-Za-z0-9_]*/)) {
+      heredoc = substr($0, RSTART, RLENGTH); sub(/^<<-?[ \t]*["\047]/, "", heredoc)
+    }
+  }
+  print out
+}'
+
+is_heavy_cmd() {
+  printf '%s\n' "$1" | awk "$STRIP_AWK" | awk -v re="$SB_HEAVY_REGEX" "$KEY_AWK"'
+    { n = split($0, seg, /;|&&|\|\||\||&|\$\(|`/); for (j = 1; j <= n; j++) if (heavy(seg[j])) found = 1 }
+    END { exit !found }'
+}
+
+heavy_progs() {
+  printf '%s\n' "$1" | awk "$STRIP_AWK" | awk -v re="$SB_HEAVY_REGEX" "$KEY_AWK"'
+    { n = split($0, seg, /;|&&|\|\||\||&|\$\(|`/); for (j = 1; j <= n; j++) if (heavy(seg[j])) printf "%s ", prog(seg[j]) }'
+}
+
+cmd_key() {
+  [ "$SB_LOG_CMD" = off ] && { heavy_progs "$1"; return; }
+  printf '%s\n' "$1" | awk "$STRIP_AWK" | awk -v re="$SB_HEAVY_REGEX" "$KEY_AWK"'
+    { n = split($0, seg, /;|&&|\|\||\||&|\$\(|`/)
+      for (j = 1; j <= n; j++) if (heavy(seg[j])) {
+        k = cmd_sig(seg[j], 1); m = split(k, w, " "); k = ""
+        for (i = 1; i <= m; i++) {
+          d = w[i]; if (i > 1 && (w[i] !~ /^[a-z][a-z0-9:_-]*$/ || length(w[i]) > 16 || gsub(/[0-9]/, "", d) > 1)) w[i] = "*"
+          k = k (k == "" ? "" : " ") w[i]
+        }
+        out = out (out == "" ? "" : ",") k
+      } }
+    END { printf "%s", out }'
+}
+
+sample() {
+  if [ "$(uname)" = Darwin ]; then
+    MEM_FREE=$(sysctl -n kern.memorystatus_level 2>/dev/null)
+    PRESSURE=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+    LOAD1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+    NCPU=$(sysctl -n hw.ncpu 2>/dev/null)
+    SWAP_PCT=$(sysctl -n vm.swapusage 2>/dev/null | awk '{t=$3; u=$6; sub(/M/,"",t); sub(/M/,"",u); print (t>0)?int(u*100/t):0}')
+  else
+    MEM_FREE=$(awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} END{print (t>0)?int(a*100/t):100}' /proc/meminfo 2>/dev/null)
+    PRESSURE=1
+    LOAD1=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
+    NCPU=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)
+    SWAP_PCT=$(awk '/^SwapTotal/{t=$2} /^SwapFree/{f=$2} END{print (t>0)?int((t-f)*100/t):0}' /proc/meminfo 2>/dev/null)
+  fi
+  [ -n "${SB_FAKE_MEM_FILE:-}" ] && MEM_FREE=$(cat "$SB_FAKE_MEM_FILE" 2>/dev/null)
+  MEM_FREE=$(int "${SB_FAKE_MEM:-${MEM_FREE:-}}" 100)
+  PRESSURE=$(int "${SB_FAKE_PRESSURE:-${PRESSURE:-}}" 1)
+  LOAD1=${SB_FAKE_LOAD:-${LOAD1:-0}}
+  case "$LOAD1" in ''|*[!0-9.]*) LOAD1=0 ;; esac
+  NCPU=$(int "${NCPU:-}" 1); [ "$NCPU" -gt 0 ] || NCPU=1
+  SWAP_PCT=$(int "${SB_FAKE_SWAP:-${SWAP_PCT:-}}" 0)
+}
+
+SECS_AWK='
+function secs(e,  d,p,n,s,i){ d=0; if (index(e,"-")) { split(e,p,"-"); d=p[1]; e=p[2] }
+  n=split(e,p,":"); s=0; for(i=1;i<=n;i++) s=s*60+p[i]; return d*86400+s }'
+HEAVY_ROOTS_AWK=$SECS_AWK'
+{ pid = $1; par[pid] = $2; age[pid] = secs($3); $1 = $2 = $3 = ""; if (heavy($0)) { hit[pid] = 1; pg[pid] = prog($0) } }
+END {
+  for (p in hit) {
+    root = 1; mine = (owner == ""); a = par[p]
+    for (d = 0; d < 64 && a != "" && a > 1; d++) { if (a in hit) { root = 0; break } if (a == owner) mine = 1; a = par[a] }
+    if (root && mine) print p, age[p], pg[p]
+  }
+}'
+
+ps_table() { ps -Ao pid=,ppid=,etime=,command= 2>/dev/null; }
+
+write_lease() { local tmp="${1%/*}/.${1##*/}.$$"; printf '%s\n%s\n%s\n' "$2" "$3" "$4" >"$tmp" && mv "$tmp" "$1"; }
+lease_live() {
+  local owner="" granted="" until=""
+  { read -r owner; read -r granted; read -r until; } 2>/dev/null <"$1" || [ -n "$owner$granted" ] || return 1
+  until=$(int "${until:-}" $(( $(int "${granted:-}" 0) + SB_LEASE )))
+  [ "$(now)" -lt "$until" ] || return 1
+  case "$owner" in ''|*[!0-9]*) return 0 ;; *) kill -0 "$owner" 2>/dev/null ;; esac
+}
+
+count_heavy() {
+  local exclude=${1:-} procs leases=0 f
+  if [ -n "${SB_FAKE_HEAVY:-}" ]; then
+    procs=$(int "$SB_FAKE_HEAVY" 0)
+  else
+    procs=$(ps_table | awk -v re="$SB_HEAVY_REGEX" -v owner= "$KEY_AWK$HEAVY_ROOTS_AWK" | wc -l | tr -d ' ')
+  fi
+  for f in "$SB_STATE"/leases/*; do
+    [ -f "$f" ] && [ "$f" != "$exclude" ] && lease_live "$f" && leases=$((leases + 1))
+  done
+  echo $(( ${procs:-0} + leases ))
+}
+
+why_busy() {
+  WHY=""; WHY_CODES=""
+  [ "$MEM_FREE" -lt "$SB_MEM_MIN" ] && { WHY="$WHY memory available ${MEM_FREE}% (min ${SB_MEM_MIN}%);"; WHY_CODES="$WHY_CODES,mem"; }
+  [ "$PRESSURE" -ge "$PRESSURE_CRITICAL" ] && { WHY="$WHY kernel memory pressure is critical;"; WHY_CODES="$WHY_CODES,press"; }
+  awk -v l="$LOAD1" -v n="$NCPU" -v m="$SB_LOAD_MAX" 'BEGIN{exit !(l/n > m)}' &&
+    { WHY="$WHY load ${LOAD1} on ${NCPU} cores (max ${SB_LOAD_MAX}/core);"; WHY_CODES="$WHY_CODES,load"; }
+  [ "$SB_SWAP_MAX" -gt 0 ] && [ "$SWAP_PCT" -gt "$SB_SWAP_MAX" ] && { WHY="$WHY swap ${SWAP_PCT}% used (max ${SB_SWAP_MAX}%);"; WHY_CODES="$WHY_CODES,swap"; }
+  [ "$HEAVY" -ge "$SB_MAX_HEAVY" ] && { WHY="$WHY $HEAVY heavy jobs already running (max ${SB_MAX_HEAVY});"; WHY_CODES="$WHY_CODES,heavy"; }
+  WHY=${WHY# }; WHY=${WHY%;}; WHY_CODES=${WHY_CODES#,}
+}
+
+readings() {
+  printf 'mem=%s press=%s load=%s ncpu=%s swap=%s heavy=%s' "$MEM_FREE" "$PRESSURE" "$LOAD1" "$NCPU" "$SWAP_PCT" "$HEAVY"
+}
+
+LOCK_ME=""
+lock() {
+  local i=0
+  LOCK_ME="$MYPID $(now) $RANDOM"
+  until ln -s "$LOCK_ME" "$SB_STATE/lock" 2>/dev/null; do
+    break_stale_lock
+    i=$((i + 1)); [ $i -ge $(( LOCK_GIVE_UP * 10 )) ] && return 1
+    sleep 0.1
+  done
+}
+break_stale_lock() {
+  local cur hp ht old="$SB_STATE/lock.stale.$MYPID"
+  cur=$(readlink "$SB_STATE/lock" 2>/dev/null) || return 0
+  read -r hp ht _ <<EOF
+$cur
+EOF
+  kill -0 "$hp" 2>/dev/null && [ $(( $(now) - $(int "${ht:-}" 0) )) -le "$LOCK_STALE" ] && return 0
+  rm -f "$old"
+  if mv "$SB_STATE/lock" "$old" 2>/dev/null; then
+    [ "$(readlink "$old" 2>/dev/null)" = "$cur" ] || ln -s "$(readlink "$old")" "$SB_STATE/lock" 2>/dev/null
+    rm -f "$old"
+  fi
+}
+holds() { [ "$(readlink "$SB_STATE/lock" 2>/dev/null)" = "$LOCK_ME" ]; }
+unlock() { holds && rm -f "$SB_STATE/lock"; }
+
+agent_pid() {
+  local p=$PPID c i=0
+  while [ "$p" -gt 1 ] && [ $i -lt 8 ]; do
+    c=$(ps -o comm= -p "$p" 2>/dev/null); c=${c##*/}; c=${c#-}
+    case "$c" in sh|bash|zsh|dash) p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$p" ] || return 1 ;; *) echo "$p"; return 0 ;; esac
+    i=$((i + 1))
+  done
+  return 1
+}
+
+claim_pid() {
+  ps -Ao pid= 2>/dev/null | tr -d ' ' | grep -xF -f - "$SB_STATE/claimed" >"$SB_STATE/claimed.new" 2>/dev/null
+  echo "$1" >>"$SB_STATE/claimed.new"; mv "$SB_STATE/claimed.new" "$SB_STATE/claimed"
+}
+
+watch_job() {
+  local lease=$1 owner=$2 granted=$3 progs=" $4" call=$5 i=0 t roots pid age pg p=""
+  MYPID=$(exec sh -c 'echo $PPID')
+  while [ -f "$lease" ] && lease_live "$lease"; do
+    t=$(now)
+    if lock; then
+      roots=$(ps_table | awk -v re="$SB_HEAVY_REGEX" -v owner="$owner" "$KEY_AWK$HEAVY_ROOTS_AWK")
+      while read -r pid age pg; do
+        [ -n "$pid" ] && [ "$age" -le $(( t - granted + 1 )) ] || continue
+        case "$progs" in *" $pg "*) ;; *) continue ;; esac
+        grep -qx "$pid" "$SB_STATE/claimed" 2>/dev/null || { p=$pid; break; }
+      done <<EOF
+$roots
+EOF
+      if [ -n "$p" ] && holds; then
+        claim_pid "$p"
+        rm -f "$lease"; unlock
+        break
+      fi
+      p=""; unlock
+    fi
+    i=$((i + 1)); if [ $i -lt 40 ]; then sleep 0.5; else sleep 2; fi
+  done
+  rm -f "$lease"
+  [ -n "$p" ] || return 0
+  ev start "call=$call" "pid=$p" "prog=$pg" "lag=$(( $(now) - granted ))"
+  local alive rss orph tree reniced=0
+  if [ "$SB_MODE" = enforce ]; then
+    read -r alive rss orph tree <<EOF
+$(job_tree "$p" "")
+EOF
+    # shellcheck disable=SC2086
+    [ "$SB_NICE" -gt 0 ] && renice "$SB_NICE" -p $tree >/dev/null 2>&1 && reniced=1
+    if [ "$SB_QOS" = background ] && [ "$(uname)" = Darwin ]; then
+      for t in $tree; do taskpolicy -b -p "$t" >/dev/null 2>&1; done
+    fi
+  fi
+  follow_job "$p" "$call" "$reniced"
+}
+
+job_tree() {
+  ps -Ao pid=,ppid=,rss= 2>/dev/null | awk -v root="$1" -v before="$2" '
+    { par[$1] = $2; rss[$1] = $3; kid[$2] = kid[$2] " " $1 }
+    END {
+      n = split(before " " root, b, " ")
+      for (i = 1; i <= n; i++) if (b[i] in par) walk(b[i])
+      for (p in seen) { sum += rss[p]; pids = pids " " p; if (par[p] == 1 && p != root) orph = orph "," p }
+      printf "%d %d %s%s\n", (root in par), sum, (orph == "" ? "-" : substr(orph, 2)), pids
+    }
+    function walk(p,  a, i, n) { if (p in seen) return; seen[p] = 1; n = split(kid[p], a, " "); for (i = 1; i <= n; i++) walk(a[i]) }'
+}
+
+last_wake_epoch() { sysctl -n kern.waketime 2>/dev/null | sed -n 's/^{ sec = \([0-9][0-9]*\),.*/\1/p'; }
+
+follow_job() {
+  local root=$1 call=$2 reniced=$3 start last peak=0 procs=0 alive rss orph pids="" n=0 before after wake
+  start=$(( $(now) - $(ps -o etime= -p "$root" 2>/dev/null | awk "$SECS_AWK"'{ print secs($1) } END { if (!NR) print 0 }') ))
+  last=$start
+  while :; do
+    read -r alive rss orph pids <<EOF
+$(job_tree "$root" "$pids")
+EOF
+    if [ "${alive:-0}" != 1 ]; then last=$(now); break; fi
+    last=$(now)
+    [ "${rss:-0}" -gt "$peak" ] && peak=$rss
+    set -- $pids; [ $# -gt "$procs" ] && procs=$#
+    record_minute
+    n=$((n + 1)); if [ $n -le "$FAST_CHECKS" ]; then sleep 1; continue; fi
+    before=$(now); sleep "$SB_TICK"; after=$(now)
+    if [ $(( after - before - SB_TICK )) -ge "$STALL_GAP" ]; then
+      wake=$(last_wake_epoch); [ -n "$wake" ] && [ "$wake" -lt "$before" ] && ev stall "call=$call" "gap=$(( after - before - SB_TICK ))"
+    fi
+  done
+  ev end "call=$call" "pid=$root" "dur=$(( last - start ))" "peak_mb=$(( peak / 1024 ))" "procs=$procs" "reniced=$reniced"
+  [ "${orph:--}" != - ] && ev orphan "call=$call" "pids=$(cap_list "$orph")"
+}
+
+cap_list() { printf '%s' "$1" | awk -F, '{ for (i = 1; i <= NF && i <= 20; i++) printf "%s%s", (i > 1 ? "," : ""), $i; if (NF > 20) printf ",+%d", NF - 20 }'; }
+
+record_minute() { once "pulse.$(( $(now) / 60 ))" && detach minute_reading; }
+
+minute_reading() {
+  local table roots ungated claude node
+  table=$(ps_table)
+  roots=$(printf '%s\n' "$table" | awk -v re="$SB_HEAVY_REGEX" -v owner= "$KEY_AWK$HEAVY_ROOTS_AWK" | cut -d' ' -f1)
+  ungated=$({ cat "$SB_STATE/claimed" 2>/dev/null; echo --; printf '%s\n' "$roots"; } |
+    awk '$1 == "--" { r = 1; next } !r { c[$1] = 1; next } $1 != "" && !($1 in c) { n++ } END { print n + 0 }')
+  read -r claude node <<EOF
+$(printf '%s\n' "$table" | awk '{ n = split($4, a, "/"); b = a[n] } b == "claude" { c++ } b == "node" { d++ } END { print c + 0, d + 0 }')
+EOF
+  sample; HEAVY=$(count_heavy)
+  ev pulse $(readings) "ungated=$ungated" "claude=$claude" "node=$node"
+}
+
+detach() { ( set -m; ( trap '' HUP TERM; "$@" ) </dev/null >/dev/null 2>&1 & ) 2>/dev/null; }
+
+gate() {
+  INPUT=$(cat)
+  [ "$SB_MODE" = disabled ] && exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+  local field cmd
+  for field in command cmd; do
+    cmd=$(printf '%s' "$INPUT" | jq -r --arg f "$field" '.tool_input[$f] | strings' 2>/dev/null)
+    [ -n "$cmd" ] && break
+  done
+  [ -n "$cmd" ] || exit 0
+  is_heavy_cmd "$cmd" || exit 0
+
+  mkdir -p "$SB_STATE/leases" "$SB_STATE/calls" 2>/dev/null || exit 0
+  local start owner lease verdict why0="" facts waited=0
+  start=$(now)
+  hook_facts; [ -n "$CALL" ] || CALL="$$.$start"
+  owner=$(agent_pid) || owner=""
+  lease="$SB_STATE/leases/$CALL"
+  facts=("call=$CALL" "sess=$(enc "$SESS" 36)" "agent=$(enc "$AGENT" 24)" "where=$(where_of "$CWD")" "key=$(enc "$(cmd_key "$cmd")" 80)")
+
+  while :; do
+    if [ "$SB_MODE" = observe ]; then
+      sample; HEAVY=$(count_heavy "$lease"); why_busy
+      verdict=room; [ -n "$WHY" ] && verdict=would_hold; why0=$WHY_CODES
+      break
+    fi
+    lock || { verdict=failopen; sample; HEAVY=$(count_heavy "$lease"); why_busy; why0=$WHY_CODES; break; }
+    sample; HEAVY=$(count_heavy "$lease"); why_busy
+    [ -n "$why0" ] || why0=$WHY_CODES
+    if [ -z "$WHY" ]; then
+      holds || continue
+      verdict=room; [ $waited = 1 ] && verdict=held
+      break
+    fi
+    unlock
+    if [ $(( $(now) - start )) -ge "$SB_WAIT" ]; then
+      ev gate "${facts[@]}" verdict=denied "why=$(enc "$why0")" "wait=$(( $(now) - start ))" $(readings)
+      jq -nc --arg r "swarm-brake held this command for ${SB_WAIT}s and the machine still has no room: $WHY. Do not retry it right away. Wait for the running heavy jobs to finish, run the work one job at a time (lower concurrency, fewer parallel agents), or ask the user." \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
+      exit 0
+    fi
+    sleep "$SB_POLL"; waited=1
+  done
+  write_lease "$lease" "$owner" "$(now)" "$(( $(now) + SB_LEASE ))"
+  unlock
+  echo "$start" >"$SB_STATE/calls/$CALL"
+  ev gate "${facts[@]}" "verdict=$verdict" "why=$(enc "$why0")" "wait=$(( $(now) - start ))" $(readings)
+  record_minute
+  [ -n "$owner" ] && detach watch_job "$lease" "$owner" "$(now)" "$(heavy_progs "$cmd")" "$CALL"
+  exit 0
+}
+
+done_hook() {
+  INPUT=$(cat)
+  command -v jq >/dev/null 2>&1 || exit 0
+  local f owner granted
+  hook_facts
+  [ -n "$CALL" ] || exit 0
+  f="$SB_STATE/leases/$CALL"
+  if [ -f "$f" ]; then
+    { read -r owner; read -r granted; } 2>/dev/null <"$f"
+    write_lease "$f" "$owner" "$granted" "$(( $(now) + RELEASE_GRACE ))"
+  fi
+  for f in "$SB_STATE"/leases/*; do
+    [ -f "$f" ] && ! lease_live "$f" && rm -f "$f"
+  done
+  record_minute
+  if mv "$SB_STATE/calls/$CALL" "$SB_STATE/calls/.$CALL.$$" 2>/dev/null; then
+    local status=ok; [ "$EVENT" = PostToolUseFailure ] && status=fail
+    ev done "call=$CALL" "sess=$(enc "$SESS" 36)" "status=$status"
+    rm -f "$SB_STATE/calls/.$CALL.$$"
+  fi
+  exit 0
+}
+
+reap() {
+  INPUT=$(cat 2>/dev/null)
+  [ "$SB_MODE" = disabled ] || reap_orphans
+  if command -v jq >/dev/null 2>&1; then
+    hook_facts
+    [ -n "$SESS" ] && once "turn.$(enc "$SESS" 36).$(( $(now) / 60 ))" &&
+      ev turn "sess=$(enc "$SESS" 36)" "agent=$(enc "$AGENT" 24)" "where=$(where_of "$CWD")"
+  fi
+  record_minute
+  prune
+  exit 0
+}
+
+reap_orphans() {
+  local table roots tree mb
+  table=$(ps -Ao pid=,ppid=,etime=,rss=,command= 2>/dev/null) || return 0
+  roots=$(printf '%s\n' "$table" | awk -v re="$SB_REAP_REGEX" -v age="$SB_REAP_AGE" "$SECS_AWK"'
+    { pid=$1; ppid=$2; et=$3; $1=$2=$3=$4=""; if (ppid==1 && $0 ~ re && secs(et) >= age) print pid }' | tr '\n' ' ')
+  [ -n "${roots// /}" ] || return 0
+  read -r mb tree <<EOF
+$(printf '%s\n' "$table" | awk -v roots="$roots" '
+    BEGIN{ n=split(roots,r," "); for(i=1;i<=n;i++) keep[r[i]]=1 }
+    { kid[$2]=kid[$2] " " $1; rss[$1]=$4 }
+    END{ for (p in keep) walk(p); printf "%d%s\n", sum / 1024, out }
+    function walk(p,  a,i,n){ out = out " " p; sum += rss[p]; n=split(kid[p],a," "); for(i=1;i<=n;i++) walk(a[i]) }')
+EOF
+  # shellcheck disable=SC2086
+  kill -TERM $tree 2>/dev/null
+  detach kill_if_still_browser "$tree"
+  ev reap "roots=$(cap_list "$(echo $roots | tr ' ' ,)")" "procs=$(echo $tree | wc -w | tr -d ' ')" "rss_mb=$mb"
+}
+kill_if_still_browser() {
+  local p; sleep "$RELEASE_GRACE"
+  for p in $1; do
+    ps -o command= -p "$p" 2>/dev/null | grep -qE "$SB_REAP_REGEX" && kill -KILL "$p" 2>/dev/null
+  done
+}
+
+status() {
+  sample; HEAVY=$(count_heavy); why_busy
+  printf 'mem %s%% · load %s/%s · heavy %s/%s%s\n' "$MEM_FREE" "$LOAD1" "$NCPU" "$HEAVY" "$SB_MAX_HEAVY" "${WHY:+ · BUSY}"
+}
+
+prune() {
+  once "prune.$(date +%F)" || return 0
+  local cutoff f
+  cutoff=$(date -v-"${SB_KEEP_DAYS}"d +%F 2>/dev/null || date -d "-${SB_KEEP_DAYS} days" +%F 2>/dev/null) || return 0
+  for f in "$EV_DIR"/*.log; do
+    [ -f "$f" ] || continue
+    f=${f##*/}; [[ "${f%.log}" < "$cutoff" ]] && rm -f "$EV_DIR/$f"
+  done
+  find "$SB_STATE/stamps" -type f ! -name 'prune.*' -mmin +5 -exec rm -f {} + 2>/dev/null
+  find "$SB_STATE/stamps" -type f -name 'prune.*' -mmin +2880 -exec rm -f {} + 2>/dev/null
+  find "$SB_STATE/calls" -type f -mmin +1440 -exec rm -f {} + 2>/dev/null
+}
+
+to_epoch() {
+  local s=$1
+  case "$s" in [0-9]:[0-9][0-9]|[0-9][0-9]:[0-9][0-9]) s="$(date +%F) $s" ;; esac
+  date -j -f '%Y-%m-%d %H:%M:%S' "$s:00" +%s 2>/dev/null || date -d "$s" +%s 2>/dev/null
+}
+
+report() {
+  local days=14 at="" win=15 d files=() view
+  while [ $# -gt 0 ]; do
+    case "$1" in --days|--at|--window) [ $# -ge 2 ] || set -- --usage ;; esac
+    case "$1" in
+      --days) days=$(int "${2:-}" 14); shift 2 ;;
+      --at) at=$(to_epoch "${2:-}") || { echo "swarm-brake: cannot read time '${2:-}' (use HH:MM or 'YYYY-MM-DD HH:MM')" >&2; return 1; }; shift 2 ;;
+      --window) win=$(int "${2:-}" 15); shift 2 ;;
+      *) echo "usage: swarm-brake report [--days N] [--at TIME [--window MIN]]" >&2; return 1 ;;
+    esac
+  done
+  local from to=9999-99-99 f
+  if [ -n "$at" ]; then
+    from=$(date -r $(( at - win * 60 )) +%F 2>/dev/null || date -d "@$(( at - win * 60 ))" +%F)
+    to=$(date -r $(( at + win * 60 )) +%F 2>/dev/null || date -d "@$(( at + win * 60 ))" +%F)
+  else
+    from=$(date -v-"${days}"d +%F 2>/dev/null || date -d "-$days days" +%F 2>/dev/null) || from=0000-00-00
+  fi
+  for f in "$EV_DIR"/*.log; do
+    [ -f "$f" ] || continue
+    d=${f##*/}; d=${d%.log}
+    [[ "$d" < "$from" || "$d" > "$to" ]] || files+=("$f")
+  done
+  [ ${#files[@]} -gt 0 ] || { echo "swarm-brake: no events in $EV_DIR yet. Events are written for heavy commands only."; return 0; }
+  view=$REPORT_SUMMARY_AWK; [ -n "$at" ] && view=$REPORT_TIMELINE_AWK
+  awk -v at="${at:-0}" -v win=$(( win * 60 )) -v dmem="$DISTRESS_MEM" -v dload="$DISTRESS_LOAD" -v crit="$PRESSURE_CRITICAL" -v stallgap="$STALL_GAP" \
+    -v mode_now="$SB_MODE" "$REPORT_READ_AWK$view" "${files[@]}"
+}
+
+REPORT_READ_AWK='
+function isort(a, n,   i, j, x) { for (i = 2; i <= n; i++) { x = a[i]; for (j = i - 1; j > 0 && a[j] + 0 > x + 0; j--) a[j + 1] = a[j]; a[j + 1] = x } }
+function pct(s, q,   a, n) { n = split(s, a, " "); if (!n) return "-"; isort(a, n); return a[int((n - 1) * q) + 1] }
+function add(k, v) { L[k] = L[k] " " v }
+function short(x) { return x == "-" || x == "" ? "-" : substr(x, 1, 8) }
+function dash(x) { return x == "" ? "-" : x }
+function pc(x) { return x == "-" ? x : x "%" }
+{
+  delete f
+  for (i = 1; i <= NF; i++) { p = index($i, "="); if (p) f[substr($i, 1, p - 1)] = substr($i, p + 1) }
+  if (f["v"] != 1 || f["ts"] == "" || ((f["ev"] == "gate" || f["ev"] == "pulse") && f["ncpu"] + 0 <= 0)) { bad++; next }
+  ts = f["ts"]; m = f["mode"]; e = f["ev"]; c = f["call"]; seen_mode[m] = 1
+  if (e == "gate") {
+    if (c in gts) next
+    gts[c] = ts; gt[c] = f["t"]; gmode[c] = m; gsess[c] = f["sess"]; gwhere[c] = f["where"]; gkey[c] = f["key"]
+    gver[c] = f["verdict"]; gwhy[c] = f["why"]; gmem[c] = f["mem"]; gload[c] = f["load"] / f["ncpu"]
+    G[m]++; V[m, f["verdict"]]++
+    if (f["verdict"] == "would_hold" || (f["verdict"] == "failopen" && f["why"] != "-")) NOROOM[m]++
+    if (f["why"] != "-") { n = split(f["why"], w, ","); for (j = 1; j <= n; j++) WHYC[m, w[j]]++ }
+    if (f["verdict"] == "held") { add("wait" m, f["wait"]); WAITSUM[m] += f["wait"] }
+    if (f["verdict"] == "denied") DEN[m]++
+    k = f["sess"] SUBSEP f["key"]
+    if ((k in lastdeny) && ts - lastdeny[k] <= 300) RETRY[m]++
+    if (f["verdict"] == "denied") lastdeny[k] = ts
+    add("gload" m, gload[c]); add("gmem" m, f["mem"])
+    if (f["verdict"] != "denied" && f["heavy"] + 1 > PEAK[m]) PEAK[m] = f["heavy"] + 1
+  } else if (e == "start") { sts[c] = ts; st[c] = f["t"]; sprog[c] = f["prog"]
+  } else if (e == "end") { ets[c] = ts; et[c] = f["t"]; edur[c] = f["dur"]; epeak[c] = f["peak_mb"]
+  } else if (e == "orphan") { n = split(f["pids"], w, ","); for (j = 1; j <= n; j++) orphan_of[w[j]] = c
+  } else if (e == "pulse") {
+    P[m]++; lc = f["load"] / f["ncpu"]; add("pload" m, lc); add("pmem" m, f["mem"])
+    if (f["mem"] < dmem || f["press"] >= crit || lc > dload) DIS[m]++
+    if (f["mem"] < dmem || f["press"] >= crit) DISM[m]++; if (lc > dload) DISL[m]++
+    if (f["heavy"] > PEAK[m]) PEAK[m] = f["heavy"]; if (f["ungated"] > UNG[m]) UNG[m] = f["ungated"]
+    if (at && ts >= at - win && ts <= at + win) tl[++ntl] = sprintf("%-9s %3s%%  %-8s %5.2f  %4s%%  %5s  %7s  %6s  %4s", f["t"], f["mem"], (f["press"] >= crit ? "critical" : f["press"] >= 2 ? "warn" : "ok"), lc, f["swap"], f["heavy"], f["ungated"], f["claude"], f["node"])
+  } else if (e == "stall") { STALL[m]++; if (f["gap"] > STALLMAX[m]) STALLMAX[m] = f["gap"]
+    if (at && ts >= at - win && ts <= at + win) tl[++ntl] = sprintf("%-9s STALL: a scheduled check ran %s s late", f["t"], f["gap"])
+  } else if (e == "reap") { R[m]++; RMB[m] += f["rss_mb"]; nr++; rts[nr] = ts; rt[nr] = f["t"]; rroots[nr] = f["roots"]; rmb[nr] = f["rss_mb"]; rmode[nr] = m
+  } else if (e == "turn") { if (at && ts >= at - win && ts <= at + win) { present[f["sess"]] = f["where"] } }
+}
+function skipped() { if (bad) printf "\n%d malformed lines skipped\n", bad }'
+
+REPORT_SUMMARY_AWK='
+END { summary(); skipped() }
+function col(label, k,   i, mm) { printf "  %-42s", label; for (i = 1; i <= nm; i++) { mm = M[i]; printf " %-22s", dash(VAL[mm, k]) } printf "\n" }
+function summary(   i, mm, r, a, n, j, k, c, ok) {
+  for (r = 1; r <= nr; r++) { n = split(rroots[r], a, ","); for (j = 1; j <= n; j++) if (a[j] in orphan_of) { ATTR[rmode[r]]++; break } }
+  split("observe enforce disabled", order, " ")
+  for (i = 1; i <= 3; i++) if (order[i] in seen_mode) M[++nm] = order[i]
+  for (i = 1; i <= nm; i++) {
+    mm = M[i]
+    VAL[mm, "hours"] = sprintf("%.1f", P[mm] / 60); VAL[mm, "gated"] = G[mm] + 0
+    VAL[mm, "noroom"] = sprintf("%d (%d%%)", NOROOM[mm], G[mm] ? 100 * NOROOM[mm] / G[mm] : 0)
+    VAL[mm, "why"] = sprintf("h%d l%d m%d p%d", WHYC[mm, "heavy"], WHYC[mm, "load"], WHYC[mm, "mem"], WHYC[mm, "press"])
+    VAL[mm, "held"] = mm == "enforce" ? V[mm, "held"] + 0 : "-"
+    VAL[mm, "wait"] = mm == "enforce" && V[mm, "held"] ? pct(L["wait" mm], .5) "s/" pct(L["wait" mm], .9) "s" : "-"
+    VAL[mm, "denied"] = mm == "enforce" ? sprintf("%d (retry %d)", DEN[mm], RETRY[mm]) : "-"
+    VAL[mm, "would"] = mm == "observe" ? V[mm, "would_hold"] + 0 : "-"
+    VAL[mm, "failopen"] = V[mm, "failopen"] + 0
+    VAL[mm, "peak"] = PEAK[mm] + 0; VAL[mm, "ung"] = UNG[mm] + 0
+    VAL[mm, "dis"] = P[mm] ? sprintf("%d (%.1f/h)", DIS[mm], 60 * DIS[mm] / P[mm]) : "-"
+    VAL[mm, "dism"] = DISM[mm] + 0; VAL[mm, "disl"] = DISL[mm] + 0
+    VAL[mm, "stall"] = STALL[mm] ? STALL[mm] ", max " STALLMAX[mm] "s" : 0
+    VAL[mm, "gload"] = pct(L["gload" mm], .5); VAL[mm, "pload"] = pct(L["pload" mm], .5)
+    VAL[mm, "gmem"] = pc(pct(L["gmem" mm], .5)); VAL[mm, "pmem"] = pc(pct(L["pmem" mm], .5))
+    VAL[mm, "waitsum"] = mm == "enforce" ? sprintf("%.1f min", WAITSUM[mm] / 60) : "-"
+    VAL[mm, "reap"] = R[mm] ? sprintf("%d, %d MB (%d traced)", R[mm], RMB[mm], ATTR[mm]) : 0
+  }
+  printf "swarm-brake report · mode now: %s\n\n  %-42s", mode_now, ""
+  for (i = 1; i <= nm; i++) printf " %-22s", M[i]; printf "\n"
+  col("active hours (minutes with a reading)", "hours")
+  col("heavy calls gated", "gated")
+  print "what the gate controls"
+  col("heavy starts while there was no room", "noroom")
+  col("  why (heavy, load, mem, pressure)", "why")
+  col("  would have been held (observe)", "would")
+  col("  let through, lock busy", "failopen")
+  col("held, then ran", "held")
+  col("  wait median/p90", "wait")
+  col("denied", "denied")
+  col("heavy jobs at once, peak", "peak")
+  col("heavy processes outside gated calls, peak", "ung")
+  print "what the machine felt (fixed limits: mem < " dmem "% or critical pressure, load > " dload "/core)"
+  col("distress minutes", "dis")
+  col("  memory", "dism")
+  col("  load", "disl")
+  col("stalls (checks " stallgap "+ s late, not sleep)", "stall")
+  col("load per core at heavy calls, median", "gload")
+  col("load per core any minute, median", "pload")
+  col("memory available at heavy calls, median", "gmem")
+  col("memory available any minute, median", "pmem")
+  print "what it cost"
+  col("agent time spent waiting", "waitsum")
+  print "cleanup (runs in every mode, so the columns do not compare it)"
+  col("orphan trees reaped", "reap")
+  n = 0; for (c in edur) { k = sprog[c]; if (k == "") continue; if (!(k in J)) jp[++n] = k; J[k]++; add("d" k, edur[c]); add("p" k, epeak[c]) }
+  if (n) {
+    printf "\njob sizes\n  %-24s %5s %10s %8s %11s %9s\n", "program", "jobs", "median dur", "p90 dur", "median peak", "p90 peak"
+    for (i = 1; i <= n; i++) { k = jp[i]; printf "  %-24s %5d %9ss %7ss %8s MB %6s MB\n", k, J[k], pct(L["d" k], .5), pct(L["d" k], .9), pct(L["p" k], .5), pct(L["p" k], .9) }
+  }
+  print "\nLimits: different periods ran different work. Distress also comes from work the gate never sees"
+  print "(browsers, MCP servers, idle sessions), counted only as processes outside gated calls. \"Starts while"
+  print "there was no room\" is the number the plugin controls; distress minutes are the outcome, with"
+  print "confounders. A hard hang writes nothing: look for a gap in the minutes. Counts are small; read them."
+}'
+
+REPORT_TIMELINE_AWK='
+END { timeline(); skipped() }
+function timeline(   c, n, i, j, s, e, k, best, bs, a, sm) {
+  printf "swarm-brake · %d minutes either side of the time asked · mode now: %s\n", win / 60, mode_now
+  printf "\nmachine, one reading a minute while agents were active\n%-9s %4s  %-8s %5s  %5s  %5s  %7s  %6s  %4s\n", "time", "mem", "pressure", "load", "swap", "heavy", "ungated", "claude", "node"
+  if (!ntl) print "  (no readings in this window)"
+  for (i = 1; i <= ntl; i++) print tl[i]
+  printf "\nheavy calls in the window\n%-9s %-9s %6s %8s  %-26s %-9s %-22s %s\n", "start", "end", "dur", "peak", "command", "session", "where", "gate said"
+  for (c in gts) {
+    s = (c in sts) ? sts[c] : gts[c]; e = (c in ets) ? ets[c] : ((c in sts) ? 2147483647 : gts[c])
+    if (s > at + win || e < at - win) continue
+    n++; ord[n] = c; okey[n] = s
+  }
+  for (i = 2; i <= n; i++) { k = ord[i]; s = okey[i]; for (j = i - 1; j > 0 && okey[j] > s; j--) { ord[j + 1] = ord[j]; okey[j + 1] = okey[j] } ord[j + 1] = k; okey[j + 1] = s }
+  if (!n) print "  (none)"
+  for (i = 1; i <= n; i++) {
+    c = ord[i]; inwin[gsess[c]] = 1
+    printf "%-9s %-9s %6s %8s  %-26s %-9s %-22s %s%s\n", (c in st) ? st[c] : gt[c], (c in et) ? et[c] : ((c in sts) ? "running?" : "-"), (c in edur) ? edur[c] "s" : "-", (c in epeak) ? epeak[c] " MB" : "-", substr(gkey[c], 1, 26), short(gsess[c]), substr(gwhere[c], 1, 22), gver[c], (gwhy[c] != "-" ? " (" gwhy[c] ")" : "")
+    sm[gsess[c]] += epeak[c]
+  }
+  k = 0
+  for (j = 1; j <= nr; j++) if (rts[j] >= at - win && rts[j] <= at + win) {
+    if (!k++) print "\norphans reaped"
+    n = split(rroots[j], a, ","); s = ""
+    for (i = 1; i <= n; i++) if (a[i] in orphan_of) s = "left by " orphan_of[a[i]] " (session " short(gsess[orphan_of[a[i]]]) ", " gwhere[orphan_of[a[i]]] ")"
+    printf "%-9s %s MB freed, roots %s %s\n", rt[j], rmb[j], rroots[j], s
+  }
+  k = 0
+  for (s in present) if (!(s in inwin)) { if (!k++) print "\nsessions present that started no heavy work"; printf "  %s  %s\n", short(s), present[s] }
+  best = ""; bs = -1; for (s in sm) if (sm[s] > bs) { bs = sm[s]; best = s }
+  if (best != "") printf "\nlargest by summed peak memory: session %s, %d MB\n", short(best), bs
+}'
+
+case "${1:-}" in
+  gate) gate ;;
+  done) done_hook ;;
+  reap) reap ;;
+  status) status ;;
+  report) shift; report "$@"; exit ;;
+  classify) is_heavy_cmd "${2:-}" && echo heavy || echo light ;;
+  *) echo "usage: swarm-brake gate|done|reap|status|classify <command>|report [--days N] [--at TIME [--window MIN]]" >&2 ;;
+esac
+exit 0

@@ -1,0 +1,16 @@
+{
+  "name": "swarm-brake",
+  "owner": {
+    "name": "Akash Solanki"
+  },
+  "metadata": {
+    "description": "Keep Claude Code and Codex agent swarms from freezing your Mac."
+  },
+  "plugins": [
+    {
+      "name": "swarm-brake",
+      "source": "./",
+      "description": "Makes heavy agent jobs wait when memory or CPU runs low, and cleans up leftover headless Chrome."
+    }
+  ]
+}

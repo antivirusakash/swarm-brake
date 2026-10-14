@@ -1,0 +1,25 @@
+{
+  "name": "swarm-brake",
+  "version": "0.1.0",
+  "description": "Stop Claude Code and Codex agent swarms from freezing your Mac. Heavy jobs like video renders, builds and headless browsers wait their turn when memory or CPU runs low, leftover Chrome processes get cleaned up, and a log shows what froze your machine.",
+  "author": {
+    "name": "Akash Solanki"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "claude-code-hooks",
+    "codex",
+    "ai-agents",
+    "subagents",
+    "agent-swarm",
+    "vibe-coding",
+    "macos",
+    "memory",
+    "cpu",
+    "developer-tools",
+    "headless-chrome",
+    "remotion"
+  ]
+}
