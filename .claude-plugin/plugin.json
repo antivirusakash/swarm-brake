@@ -21,5 +21,6 @@
     "developer-tools",
     "headless-chrome",
     "remotion"
-  ]
+  ],
+  "icon": "./.claude-plugin/icon.png"
 }

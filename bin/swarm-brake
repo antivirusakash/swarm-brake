@@ -108,7 +108,7 @@ function cmd_sig(s, strict,   n,w,i,b,out,k) {
     if (b ~ /^(npm|pnpm|yarn|bun)$/ && w[i+1] ~ /^(exec|dlx|x)$/) { i += 2; continue }
     if (b ~ /^(uv|poetry|pipenv|pdm)$/ && w[i+1] == "run") { i += 2; i = skipflags(w, n, i); continue }
     if (b == "yarn" && w[i+1] == "workspace") { w[i+2] = "yarn"; i += 2; continue }
-    if (b !~ /^(npx|bunx|pnpx|uvx|time|nice|ionice|nohup|exec|sudo|env|command|caffeinate|timeout|gtimeout|xcrun|arch|stdbuf|xargs|parallel|watch|node|deno|python[0-9.]*|bash|sh|zsh)$/) break
+    if (b !~ /^((np|bun|pnp|uv)x|time|nice|ionice|nohup|exec|sudo|env|command|caffeinate|timeout|gtimeout|xcrun|arch|stdbuf|xargs|parallel|watch|node|deno|python[0-9.]*|bash|sh|zsh)$/) break
     i++; i = skipflags(w, n, i)
     while (i <= n && (w[i] ~ /^[0-9.]+[smhd]?$/ || w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) i++
   }
