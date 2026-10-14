@@ -22,5 +22,7 @@
     "headless-chrome",
     "remotion"
   ],
-  "icon": "./.claude-plugin/icon.png"
+  "icon": "./.claude-plugin/icon.png",
+  "homepage": "https://github.com/antivirusakash/swarm-brake",
+  "repository": "https://github.com/antivirusakash/swarm-brake"
 }
