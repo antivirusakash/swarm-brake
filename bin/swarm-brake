@@ -147,10 +147,10 @@ heredoc != "" && q == "" { t = $0; sub(/^\t+/, "", t); if (t == heredoc) heredoc
     else if (c == q || (q == "A" && c == "\047")) { q = ""; if (keep) out = out ";" }
     else if (keep) out = out c
   }
-  if (q == "" && match(out, /(^|[^<])<<-?[ \t]*Q?[A-Za-z_][A-Za-z0-9_]*/)) {
-    heredoc = substr(out, RSTART, RLENGTH); sub(/^[^<]?<<-?[ \t]*Q?/, "", heredoc)
-    if (substr(out, RSTART, RLENGTH) ~ /Q[A-Za-z_]*$/ && match($0, /<<-?[ \t]*["\047][A-Za-z_][A-Za-z0-9_]*/)) {
-      heredoc = substr($0, RSTART, RLENGTH); sub(/^<<-?[ \t]*["\047]/, "", heredoc)
+  if (q == "" && match(out, /(^|[^<])[<][<]-?[ \t]*Q?[A-Za-z_][A-Za-z0-9_]*/)) {
+    heredoc = substr(out, RSTART, RLENGTH); sub(/^[^<]?[<][<]-?[ \t]*Q?/, "", heredoc)
+    if (substr(out, RSTART, RLENGTH) ~ /Q[A-Za-z_]*$/ && match($0, /[<][<]-?[ \t]*["\047][A-Za-z_][A-Za-z0-9_]*/)) {
+      heredoc = substr($0, RSTART, RLENGTH); sub(/^[<][<]-?[ \t]*["\047]/, "", heredoc)
     }
   }
   print out
